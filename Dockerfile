@@ -1,30 +1,23 @@
-# Use a slim Python image for a smaller footprint
+# Use a slim Python image
 FROM python:3.14-slim
 
-# Set the working directory inside the container
+# Set work directory
 WORKDIR /app
 
-# Install system utilities needed for image processing and high-performance libraries
-RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
+# Install minimal build tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy only requirements first to leverage Docker cache
+# Copy requirements and install
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the entire project into the container
+# Copy the rest of the app
 COPY . .
 
-# Expose the port FastAPI runs on
+# Expose port 8000
 EXPOSE 8000
 
-# Set environment variables (Defaults - should be overridden in hosting settings)
-ENV PYTHONUNBUFFERED=1
-ENV PORT=8000
-
-# Run the application using uvicorn
+# Command to run the application
 CMD ["uvicorn", "production_pipeline:app", "--host", "0.0.0.0", "--port", "8000"]
