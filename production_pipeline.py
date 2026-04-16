@@ -11,16 +11,28 @@ from PIL import Image
 import io
 import uvicorn
 import logging
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load secrets from .env
+load_dotenv()
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # CONFIG
-OCR_API_KEY = os.getenv("OCR_API_KEY", "K85146131088957")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "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")
+OCR_API_KEY = os.getenv("OCR_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OR_MODEL_ID = os.getenv("OR_MODEL_ID", "nvidia/nemotron-nano-12b-v2-vl:free")
 
-app = FastAPI(title="MarkSheet AI Parser (Reasoning Edition)")
+# Initialize OpenAI-compatible client for OpenRouter
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
+
+app = FastAPI(title="MarkSheet AI Parser (OpenRouter Edition)")
 
 # DATA MODELS
 class Subject(BaseModel):
@@ -74,13 +86,13 @@ def encode_image(image_bytes):
     return base64.b64encode(image_bytes).decode('utf-8')
 
 def generate_structured_data(image_bytes: bytes, ocr_text: str):
+    # Convert image to base64 for vision processing
     base64_image = encode_image(image_bytes)
     
     prompt = f"""
-You are an expert marksheet parser. Use the OCR text as your primary reference and the image for spatial verification.
-Extract the student name, registration ID, every subject (code, title, credits, grade), and the final GPA.
+Extract structured marksheet data from the image. Use the OCR text as a hint if helpful.
 
-OCR TEXT:
+OCR TEXT FROM PRE-PROCESSING:
 {ocr_text}
 
 JSON FORMAT:
@@ -88,80 +100,88 @@ JSON FORMAT:
   "name": "Full Student Name",
   "registration_no": "Registration No",
   "subjects": [
-    {{"code": "Course Code", "title": "Title", "credits": "Credits", "grade": "Grade"}}
+    {{
+      "code": "Course Code",
+      "title": "Title",
+      "credits": "Credits",
+      "grade": "Grade"
+    }}
   ],
   "gpa": "GPA"
 }}
 
-Return ONLY the JSON.
+Return ONLY the JSON object.
 """
 
-    # Using Nvidia Vision-Language model as primary (requested by user)
+    # Robust list of visions models + reasoning models
     models_to_try = [
         "nvidia/nemotron-nano-12b-v2-vl:free",
         "google/gemma-4-26b-a4b-it:free",
-        "google/gemma-4-31b-it:free",
-        "liquid/lfm-2.5-1.2b-thinking:free",
-        "qwen/qwen3-next-80b-a3b-instruct:free"
+        "google/gemini-2.0-flash-exp:free",
+        "meta-llama/llama-3.1-8b-instruct:free",
+        "google/gemma-2-9b-it:free"
     ]
     
+    last_error = None
     for model_id in models_to_try:
         try:
-            logger.info(f"Attempting reasoning-enabled extraction with {model_id}...")
-            payload = {
-                "model": model_id,
-                "messages": [
+            logger.info(f"Attempting extraction with {model_id}...")
+            response = client.chat.completions.create(
+                model=model_id,
+                messages=[
                     {
                         "role": "user",
                         "content": [
                             {"type": "text", "text": prompt},
                             {
                                 "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}"
+                                }
                             }
                         ]
                     }
-                ],
-                "reasoning": {"enabled": True}
-            }
+                ]
+            )
             
-            headers = {
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            
-            response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=90)
-            res_json = response.json()
-            
-            if "choices" not in res_json:
-                logger.warning(f"Model {model_id} error: {res_json.get('error')}")
-                continue
-                
-            choice = res_json["choices"][0]
-            if "reasoning_details" in choice["message"]:
-                logger.debug(f"AI Reasoning: {choice['message']['reasoning_details']}")
-                
-            response_text = choice["message"]["content"]
+            response_text = response.choices[0].message.content
             match = re.search(r"\{.*\}", response_text, re.DOTALL)
             if match:
                 logger.info(f"Successfully used {model_id}!")
                 return json.loads(match.group())
-                
-        except Exception as e:
-            logger.warning(f"Failed with {model_id}: {e}")
-            continue
             
-    raise ValueError("All reasoning-enabled models failed.")
+        except Exception as e:
+            last_error = e
+            error_str = str(e).lower()
+            if "429" in error_str or "rate" in error_str:
+                logger.warning(f"Model {model_id} is rate-limited, trying next...")
+                continue
+            elif "404" in error_str:
+                logger.warning(f"Model {model_id} not found, trying next...")
+                continue
+            else:
+                logger.error(f"Unexpected error with {model_id}: {e}")
+                continue
+                
+    raise ValueError(f"All free models failed or rate-limited. Last error: {last_error}")
 
 # API ENDPOINTS
 @app.post("/parse-marksheet", response_model=MarkSheetData)
 async def parse_marksheet(file: UploadFile = File(...)):
     try:
         contents = await file.read()
+        
+        logger.info("Step 1: Running OCR.space...")
         ocr_text = run_ocr(contents)
-        print(f"\n--- OCR TEXT ---\n{ocr_text}\n---------------\n")
+        print("\n--- RAW OCR TEXT ---")
+        print(ocr_text)
+        print("--------------------\n")
+        
+        logger.info(f"Step 2: Processing with {OR_MODEL_ID} via OpenRouter...")
         structured_data = generate_structured_data(contents, ocr_text)
+        
         return MarkSheetData(**structured_data)
+        
     except Exception as e:
         logger.exception("Upload failed")
         raise HTTPException(status_code=500, detail=str(e))
@@ -174,62 +194,65 @@ async def index():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI MarkSheet Reasoning Parser</title>
+    <title>MarkSheet AI Parser</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
     <style>
-        :root { --primary: #8b5cf6; --bg: #030712; --card: #111827; --text: #f9fafb; }
-        body { font-family: 'Outfit', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; display: flex; align-items: center; justify-content: center; margin: 0; }
-        .box { width: 90%; max-width: 900px; background: var(--card); border: 1px solid #1f2937; border-radius: 20px; padding: 30px; }
-        .dropzone { border: 2px dashed #374151; border-radius: 12px; padding: 40px; text-align: center; cursor: pointer; transition: 0.3s; }
-        .dropzone:hover { border-color: var(--primary); background: #1f2937; }
-        .btn { background: var(--primary); color: white; border: none; padding: 12px 30px; border-radius: 8px; font-weight: 600; cursor: pointer; margin-top: 20px; width: 100%; transition: 0.2s; }
-        .btn:hover { background: #7c3aed; }
-        #results { margin-top: 30px; display: none; }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 0.9em; }
-        th, td { padding: 12px; border-bottom: 1px solid #1f2937; text-align: left; }
-        .loader { display: none; text-align: center; margin: 20px 0; color: #a78bfa; }
+        :root { --primary: #6366f1; --bg: #0f172a; --card-bg: rgba(30, 41, 59, 0.7); --text: #f8fafc; }
+        body { font-family: 'Outfit', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; display: flex; align-items: center; justify-content: center; margin: 0; padding: 20px; }
+        .container { width: 100%; max-width: 800px; background: var(--card-bg); backdrop-filter: blur(12px); border-radius: 24px; padding: 40px; border: 1px solid rgba(255,255,255,0.1); }
+        h1 { background: linear-gradient(to right, #818cf8, #c084fc); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .upload-area { border: 2px dashed rgba(255,255,255,0.2); border-radius: 16px; padding: 40px; text-align: center; cursor: pointer; position: relative; }
+        .upload-area:hover { border-color: var(--primary); }
+        .upload-area input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+        .btn { background: var(--primary); color: white; border: none; padding: 12px 32px; border-radius: 12px; font-weight: 600; cursor: pointer; margin-top: 20px; }
+        #result { margin-top: 40px; display: none; }
+        .subject-table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        .subject-table th, .subject-table td { text-align: left; padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+        .loader { display: none; margin-top: 20px; text-align: center; }
+        .spinner { width: 32px; height: 32px; border: 3px solid rgba(255,255,255,.3); border-radius: 50%; border-top-color: var(--primary); animation: spin 1s linear infinite; margin: 0 auto; }
+        @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
-    <div class="box">
-        <h1 style="margin-top:0;">Brainy MarkSheet Parser</h1>
-        <p style="color:#9ca3af;">Using Deep Reasoning LLMs via OpenRouter</p>
-        <form id="pForm">
-            <div class="dropzone" onclick="document.getElementById('f').click()">
-                <span id="label">Select MarkSheet Scan</span>
-                <input type="file" id="f" style="display:none" accept="image/*" onchange="document.getElementById('label').innerText=this.files[0].name">
+    <div class="container">
+        <h1>MarkSheet OpenRouter Parser</h1>
+        <p>Using Google Gemini Flash via OpenRouter (Bypassing Quota Limits)</p>
+        <form id="uploadForm">
+            <div class="upload-area">
+                <span style="font-size: 48px;">📄</span>
+                <p id="fileName">Select marksheet image</p>
+                <input type="file" name="file" id="fileInput" accept="image/*" required>
             </div>
-            <button type="submit" class="btn">Start AI Reasoning Pipeline</button>
+            <button type="submit" class="btn" id="submitBtn">Extract Data</button>
         </form>
-        <div class="loader" id="l">⚡ AI is Reasoning through your document...</div>
-        <div id="results">
-            <h2 id="n" style="margin-bottom:5px;"></h2>
-            <p id="r" style="color:#9ca3af; margin-top:0;"></p>
-            <table>
+        <div class="loader" id="loader"><div class="spinner"></div><p>AI Parsing...</p></div>
+        <div id="result">
+            <h3 id="resName" style="color: #818cf8;"></h3>
+            <p id="resReg"></p>
+            <table class="subject-table" id="subjectTable">
                 <thead><tr><th>Code</th><th>Subject</th><th>Credits</th><th>Grade</th></tr></thead>
-                <tbody id="b"></tbody>
+                <tbody></tbody>
             </table>
-            <h4 style="margin-top:20px;">GPA: <span id="g"></span></h4>
+            <p><strong>GPA: <span id="resGPA"></span></strong></p>
         </div>
     </div>
     <script>
-        document.getElementById('pForm').onsubmit = async (e) => {
+        const uploadForm = document.getElementById('uploadForm');
+        uploadForm.onsubmit = async (e) => {
             e.preventDefault();
-            const f = document.getElementById('f').files[0];
-            if(!f) return;
-            document.getElementById('l').style.display='block';
-            document.getElementById('results').style.display='none';
-            const fd = new FormData(); fd.append('file', f);
+            document.getElementById('loader').style.display = 'block';
+            document.getElementById('result').style.display = 'none';
+            const formData = new FormData();
+            formData.append('file', document.getElementById('fileInput').files[0]);
             try {
-                const r = await fetch('/parse-marksheet', {method:'POST', body:fd});
-                const d = await r.json();
-                document.getElementById('n').innerText = d.name;
-                document.getElementById('r').innerText = 'Reg No: ' + d.registration_no;
-                document.getElementById('g').innerText = d.gpa;
-                document.getElementById('b').innerHTML = d.subjects.map(s => `<tr><td>${s.code}</td><td>${s.title}</td><td>${s.credits}</td><td>${s.grade}</td></tr>`).join('');
-                document.getElementById('results').style.display='block';
-            } catch(e) { alert('Thinking error: ' + e); }
-            finally { document.getElementById('l').style.display='none'; }
+                const res = await fetch('/parse-marksheet', { method: 'POST', body: formData });
+                const data = await res.json();
+                document.getElementById('resName').textContent = data.name;
+                document.getElementById('resReg').textContent = data.registration_no;
+                document.getElementById('resGPA').textContent = data.gpa;
+                document.querySelector('#subjectTable tbody').innerHTML = data.subjects.map(s => `<tr><td>${s.code}</td><td>${s.title}</td><td>${s.credits}</td><td>${s.grade}</td></tr>`).join('');
+                document.getElementById('result').style.display = 'block';
+            } catch (err) { alert(err); } finally { document.getElementById('loader').style.display = 'none'; }
         }
     </script>
 </body>

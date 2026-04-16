@@ -5,4 +5,4 @@ pydantic
 requests
 pillow
 openai
-google-genai
+python-dotenv
